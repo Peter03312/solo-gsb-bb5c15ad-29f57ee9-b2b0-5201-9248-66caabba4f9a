@@ -24,10 +24,27 @@
 修订内容不可变（差量行一经写入永不修改），规划/确认/批次/改期复核按同一
 修订号读到的永远是同一份还原结果；修订生成仍在 ``BEGIN IMMEDIATE`` 事务
 内串行生效。
+
+非有限值（±∞/NaN）防护
+-----------------------
+- **写路径拒绝**：名义潮位与误差的提交值必须是有限数（``math.isfinite``），
+  误差还须非负；非法提交 ``422 VALIDATION_ERROR`` 且整次不生成修订（HTTP
+  层另由 Pydantic ``allow_inf_nan=False`` 兜底；服务层再校验一次以覆盖全部
+  调用方）。
+- **历史异常不改写**：旧版本缺陷曾允许极大 JSON 数字（如 ``1e309``）落成
+  ``±∞``。这些异常值随不可变修订原样保留，读取（范围查询/规划/确认/批次/
+  复核改期）命中时由 :func:`find_non_finite_minutes` 检出，统一抛
+  ``422 NON_FINITE_TIDE_DATA``（带修订号与分钟；绝不按安全放行、不回退
+  500）。
+- **分叉恢复是逐字段的**：以旧异常修订分叉时，差量行保存该分钟的最终值——
+  只有被有限新值覆盖的字段恢复；另一字段及未覆盖分钟仍沿基础链继承异常值，
+  继续按异常拒绝。即更正只覆盖名义潮位（误差沿用，异常误差仍异常）、误差
+  修订只覆盖误差（名义潮位沿用，异常名义仍异常）。
 """
+import math
 from typing import Iterable, Optional
 
-from ..errors import ApiError
+from ..errors import ApiError, tide_non_finite
 
 
 # ---- 读取（沿基础链还原） -------------------------------------------------------
@@ -118,7 +135,74 @@ def resolve_tide_minutes(conn, revision: int, minutes: Iterable[int]
     return _reconstruct(conn, revision, f"minute IN ({placeholders})", tuple(unique))
 
 
+# ---- 非有限值（±∞/NaN）检测 -------------------------------------------------------
+
+def find_non_finite_minutes(tide: dict[int, tuple[float, float]]
+                            ) -> tuple[list[int], set[str]]:
+    """在还原结果中找非有限的分钟与其异常字段。
+
+    返回 ``(分钟列表, {"level" 和/或 "error"})``，分钟按升序。历史不可变修订
+    中由旧缺陷遗留的 ±∞/NaN 由此统一检出，调用方据以抛
+    ``NON_FINITE_TIDE_DATA``，绝不把异常值当安全数据使用。
+    """
+    minutes: list[int] = []
+    fields: set[str] = set()
+    for m in sorted(tide):
+        level, error = tide[m]
+        bad_level = not math.isfinite(level)
+        bad_error = not math.isfinite(error)
+        if bad_level or bad_error:
+            minutes.append(m)
+            if bad_level:
+                fields.add("level")
+            if bad_error:
+                fields.add("error")
+    return minutes, fields
+
+
+def require_finite_tide(revision: int,
+                        tide: dict[int, tuple[float, float]]) -> None:
+    """读取已存修订的还原结果后调用：含非有限分钟即拒绝（422）。"""
+    minutes, fields = find_non_finite_minutes(tide)
+    if minutes:
+        raise tide_non_finite(revision, minutes, fields)
+
+
 # ---- 写入（差量落库） -----------------------------------------------------------
+
+def _validate_finite_corrections(corrections: dict[int, float]) -> None:
+    """名义潮位更正的提交值必须为有限数，否则 422（整次不生成修订）。"""
+    bad = [{"minute": m, "level": _describe(v)}
+           for m, v in sorted(corrections.items()) if not math.isfinite(v)]
+    if bad:
+        raise ApiError(
+            422, "VALIDATION_ERROR",
+            "名义潮位必须为有限数（米），拒绝 ±∞/NaN（如 1e309 会解析为无穷大）",
+            {"bad_corrections": bad},
+        )
+
+
+def _validate_finite_errors(errors: dict[int, float]) -> None:
+    """误差修订的提交值必须为有限非负数，否则 422（整次不生成修订）。"""
+    bad = [{"minute": m, "error": _describe(v)}
+           for m, v in sorted(errors.items())
+           if not math.isfinite(v) or v < 0]
+    if bad:
+        raise ApiError(
+            422, "VALIDATION_ERROR",
+            "潮位误差必须为有限非负数（米），拒绝负值与 ±∞/NaN",
+            {"bad_errors": bad},
+        )
+
+
+def _describe(v: float):
+    """错误 details 中的可 JSON 化描述（不直接序列化 inf/NaN）。"""
+    if math.isnan(v):
+        return "NaN"
+    if math.isinf(v):
+        return "Infinity" if v > 0 else "-Infinity"
+    return v
+
 
 def resolve_base_revision(conn, base_revision: Optional[int]) -> int:
     """解析基础修订号：显式指定须存在，否则取最新修订；否则 TIDE_REVISION_NOT_FOUND。"""
@@ -167,10 +251,12 @@ def create_correction_revision(conn, corrections: dict[int, float],
 
     只覆盖所列分钟的名义潮位：被覆盖分钟的误差沿用基础修订（沿基础链还原
     取得），基础修订没有的分钟作为新分钟补入、误差 0；未列出分钟整行继承。
-    允许从非最新修订分叉。返回新修订行（revision/note/created_at）。
+    允许从非最新修订分叉。提交值必须为有限数（``422 VALIDATION_ERROR``，
+    整次不生成修订）。返回新修订行（revision/note/created_at）。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        _validate_finite_corrections(corrections)
         base = resolve_base_revision(conn, base_revision)
         inherited = resolve_tide_minutes(conn, base, corrections.keys())
         deltas = {
@@ -199,10 +285,12 @@ def create_error_revision(conn, errors: dict[int, float],
 
     名义潮位不变，只覆盖所列分钟的误差；所列分钟在基础修订中必须已有名义
     潮位（沿基础链还原判定），否则 ``MISSING_TIDE_DATA`` 且不产生新修订；
-    未列出分钟整行继承。返回新修订行（revision/note/created_at）。
+    未列出分钟整行继承。提交误差必须为有限非负数（``422 VALIDATION_ERROR``，
+    整次不生成修订）。返回新修订行（revision/note/created_at）。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        _validate_finite_errors(errors)
         base = resolve_base_revision(conn, base_revision)
         inherited = resolve_tide_minutes(conn, base, errors.keys())
         missing = [m for m in sorted(errors) if m not in inherited]

@@ -38,6 +38,14 @@
 保存**；通过则一次写入全部不可变快照。同键同内容重试返回原结果（`replayed=true`，
 即使修订已更新），同键异内容 `BATCH_KEY_CONFLICT`。旧单船接口语义完全不变。
 
+**本轮修复潮位数值校验**：名义潮位与预测误差的每个值都必须是**有限数**（误差还须
+非负）——极大 JSON 数字（如 `1e309` 会解析为 `Infinity`）、`NaN` 等一律
+`422 VALIDATION_ERROR` 且整次不生成修订。旧版本已写入不可变修订的 ±∞/NaN
+**不改写历史**：分钟范围查询命中、或单船/批次规划、确认、潮位复核与改期计算需要
+异常分钟时，一律 `422 NON_FINITE_TIDE_DATA`（带修订号与分钟；不按安全放行、不
+报 500）；以异常修订分叉时，只有异常字段被有限新值覆盖的分钟恢复，其余字段与未
+覆盖分钟仍按原规则继承。有效数据的修订继承、误差带判定与既有接口字段完全兼容。
+
 **本轮新增航段分时航时管制**：调度员以航段编号提交一组**半开分钟区间
 `[start, end)` 及正整数通行分钟**（`PUT /api/segments/{seg_id}/travel-controls`），
 **整组替换**该航段旧管制并返回生效清单；空组恢复航段基础航时。拒绝未知航段
@@ -314,6 +322,26 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
   - **旧修订视为误差 0**：早于误差功能的修订（含旧版数据库升级后的既有行）均无
     误差数据，按误差 0 处理；规划/复核目标窗口内任一分钟缺**名义潮位**即报
     `MISSING_TIDE_DATA`。
+  - **数值必须有限（±∞/NaN 防护）**：
+    - **提交校验**：名义潮位与预测误差的每个值都必须是**有限数**
+      （`math.isfinite`；极大 JSON 数字如 `1e309` 会被解析为 `Infinity`，
+      `NaN`/`-Infinity` 同理），误差还须保持**非负**。任一非法值返回
+      `422 VALIDATION_ERROR`（校验错误本身可正常 JSON 序列化），**整次不生成
+      修订**（HTTP 层 Pydantic `allow_inf_nan=False` 与服务层双重校验）。
+    - **历史异常不改写**：旧版本缺陷曾允许把无穷大写落库。修订内容不可变，
+      这些 ±∞/NaN 随历史修订**原样保留、不被清洗或改写**；读取时按分钟检出——
+      `GET /api/tide/revisions/{rev}` 查询范围命中异常分钟，或单船/批次规划、
+      单船/批次确认、潮位复核（`/review`）与改期计算（`/reschedule`）的窗口
+      需要异常分钟时，一律返回 `422 NON_FINITE_TIDE_DATA`（`details` 给出
+      `revision`、`non_finite_minutes`、异常字段 `fields` 与总数），**绝不按
+      "安全"放行（无穷潮位会把受限分钟误判为可通航），也不回退 500**。查询/
+      窗口不含异常分钟时照常服务；修订列表（不读逐分钟值）不受影响。
+    - **分叉恢复是逐字段、逐分钟的**：以异常修订为基础分叉时，只有**异常字段
+      被有限新值覆盖**的分钟恢复——名义更正只覆盖名义潮位（误差仍沿用继承，
+      异常误差不会因此恢复），误差修订只覆盖误差（异常名义潮位不会因此恢复）；
+      另一字段异常的分钟、未覆盖的异常分钟仍沿基础链继承并继续被
+      `NON_FINITE_TIDE_DATA` 拒绝。恢复后的修订与普通修订完全一致：继承、误差
+      带判定与既有接口字段均不变。
 - **规划**：默认使用**最新**修订，也可显式指定修订号。窗口内任何一分钟缺少名义
   潮位即报错。水深/净空均按所据修订的误差带保守极值核验，且每个出发区间都不得与
   既有已确认快照的航段占用重叠（重叠即视为该进入分钟不可行，等价于低潮/净空不足）。
@@ -610,8 +638,10 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 指定潮位修订不存在 / 复核时目标修订未知 / 误差修订的基础修订未知 | 404 | `TIDE_REVISION_NOT_FOUND` |
 | 复核时行程号未知 | 404 | `TRIP_NOT_FOUND` |
 | 窗口内有分钟缺名义潮位 / 误差修订提交分钟在基础修订无名义潮位 | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
+| 提交名义潮位或误差为 ±∞/NaN（如 `1e309` 解析为无穷大）/ 误差为负 | 422 | `VALIDATION_ERROR`（整次不生成修订） |
+| 查询或单船/批次规划、确认、潮位复核与改期计算命中历史修订中的非有限分钟（±∞/NaN，旧缺陷遗留；历史不改写） | 422 | `NON_FINITE_TIDE_DATA`（`details.revision`/`non_finite_minutes`/`fields`；以有限新值分叉覆盖异常字段后该分钟恢复） |
 | 窗口内无可行行程（含所有潮位可行区间均被已确认占用占满） | 404 | `NO_FEASIBLE_ITINERARY` |
-| 参数校验失败（窗口>1440、航时非正、误差为负、分钟为负等） | 422 | `VALIDATION_ERROR` |
+| 参数校验失败（窗口>1440、航时非正、误差为负、潮位/误差为 ±∞/NaN、分钟为负等） | 422 | `VALIDATION_ERROR` |
 | 确认时修订已过期（单船与批次一致） | 409 | `REVISION_STALE` |
 | 确认时行程复核不一致（潮位重算结果不同，或占用变化使提交行程不再最优/已无可行解） | 409 | `PLAN_MISMATCH` |
 | 批次预排中任一船失败（未知节点/缺潮位/无可行行程） | 同既有码 | 既有码，`details.ship_index` 给出首个失败序号（0 起） |
@@ -876,9 +906,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/ships/{ship_no}/versions` | **本轮新增**：全部历史版本（按版本号升序） |
 | GET | `/api/ships/{ship_no}/versions/{version}` | **本轮新增**：指定历史版本 |
 | GET | `/api/tide/revisions` | 潮位修订列表 |
-| GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors` |
-| POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订 |
-| POST | `/api/tide/error-revisions` | 预测误差修订（名义潮位不变），生成新修订 |
+| GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors`；范围内含历史非有限分钟（±∞/NaN）时 `422 NON_FINITE_TIDE_DATA`（不输出 Infinity/NaN、不报 500），不含异常分钟的范围照常返回 |
+| POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订；潮位必须为有限数（`1e309`/`NaN` 等 → `422 VALIDATION_ERROR`，整次不生成修订） |
+| POST | `/api/tide/error-revisions` | 预测误差修订（名义潮位不变），生成新修订；误差必须为**有限非负数**（负值、`±∞/NaN` → `422 VALIDATION_ERROR`，整次不生成修订） |
 | POST | `/api/trips/plan` | 规划最早抵达行程；**本轮扩展**：可携 `berth_id`+`work_minutes` 指定终点泊位（抵达即开工，作业区间完整落在同一开放区间且不与有效泊位占用重叠） |
 | POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核）；指定泊位时按当时日历/占用复算并固化泊位作业区间 |
 | POST | `/api/trips/batch/plan` | **本轮扩展泊位**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船航段与泊位拟占用） |
@@ -908,8 +938,9 @@ POST /api/tide/error-revisions
 }
 ```
 
-- `errors`：`{非负整数分钟: 非负误差(米)}`，不能为空；分钟或误差为负返回
-  `422 VALIDATION_ERROR`；
+- `errors`：`{非负整数分钟: 误差(米)}`，不能为空；分钟为负、误差为负或误差不是
+  有限数（`±∞/NaN`，如 `1e309` 会解析为无穷大）返回 `422 VALIDATION_ERROR`，
+  整次不生成修订；
 - `base_revision` 可省略，省略时基于**最新**修订；基础修订不存在返回
   `404 TIDE_REVISION_NOT_FOUND`；
 - 提交的任一分钟在基础修订中没有名义潮位，返回 `422 MISSING_TIDE_DATA`，不产生
@@ -970,6 +1001,82 @@ curl -s "$BASE/api/tide/revisions/3?from_minute=100&to_minute=101"
   的分钟（沿基础链还原判定），否则 `422 MISSING_TIDE_DATA` 且不产生新修订；
 - 旧库升级后，既有修订作为物化修订原样可查，新修订一律差量落库；规划、确认、
   批次与改期复核按同一修订号读到的数据与升级前完全一致。
+
+### 非有限潮位（±∞/NaN）防护请求 / 响应示例（本轮新增）
+
+旧版本曾把极大 JSON 数字（如 `1e309`，超出 double 范围）解析为 `Infinity`
+并落入不可变修订，导致查询该修订报服务错误、规划把无穷潮位分钟误判为可通航。
+本轮在**提交校验**与**历史读取**两侧同时修复。
+
+**1）新提交：潮位与误差必须为有限数（误差另须非负），否则 422 且不生成修订**
+
+```bash
+# 名义潮位更正：1e309 解析为 Infinity，拒绝
+curl -s -X POST "$BASE/api/tide/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections": {"100": 1e309}}'
+```
+
+```json
+{ "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "请求参数校验失败",
+    "details": {"errors": [
+      {"type": "finite_number",
+       "loc": ["body", "corrections", "100"],
+       "msg": "Input should be a finite number",
+       "input": "Infinity"} ]} } }
+```
+
+`NaN`、`-Infinity`（如 `-1e309`）同样拒绝；误差修订的负值与非有限值沿用同一
+`422 VALIDATION_ERROR` 口径（服务层再次校验，绕过 HTTP 直接调用亦拒绝）。
+合法的有限大数（如 `1e308`）不受影响。
+
+**2）历史异常修订：不改写；命中异常分钟的查询与计算一律 422 拒绝**
+
+历史修订不可变，旧库中已存在的 ±∞/NaN 原样保留。凡 `GET
+/api/tide/revisions/{rev}` 的分钟范围命中异常，或单船/批次规划、单船/批次确认、
+潮位复核 `/review`、改期计算 `/reschedule` 的窗口需要异常分钟时：
+
+```json
+{ "error": {
+    "code": "NON_FINITE_TIDE_DATA",
+    "message": "潮位修订 #7 有 1 个分钟的名义潮位或预测误差不是有限数（±∞/NaN，"
+               "旧版本缺陷遗留，历史修订不被改写）；请基于该修订分叉，以有限新值"
+               "覆盖异常分钟后再使用",
+    "details": {
+      "revision": 7,
+      "non_finite_minutes": [100],
+      "total_non_finite": 1,
+      "fields": ["level"]
+    } } }
+```
+
+- 不按"安全"放行：异常分钟绝不参与水深/净空通航判定（否则 `inf` 会让任意吃水
+  通过）；也不回退 500（响应不携带裸 `Infinity/NaN`）；
+- 范围/窗口**不含**异常分钟时照常服务（异常不污染其他分钟；修订列表始终可查）；
+- 批次预排/确认在 `details` 另附 `ship_index`（首个失败序号，0 起）。
+
+**3）分叉恢复：仅异常字段被有限新值覆盖的分钟恢复**
+
+```bash
+# 修订 #7 的分钟 100：level=inf；分钟 101：error=inf
+# 先用有限名义潮位覆盖分钟 100（其误差沿继承为有限 0）
+curl -s -X POST "$BASE/api/tide/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision": 7, "corrections": {"100": 2.0}}'
+# -> 201 修订 #8：分钟 100 恢复；分钟 101 的 error 仍为 inf，继续 422
+
+# 再用有限误差覆盖分钟 101（名义潮位沿继承，为有限值）
+curl -s -X POST "$BASE/api/tide/error-revisions" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision": 8, "errors": {"101": 0.0}}'
+# -> 201 修订 #9：分钟 101 恢复；整窗误差带判定恢复正常
+```
+
+更正只覆盖名义潮位字段、误差修订只覆盖误差字段：另一字段异常的分钟不会"顺带
+恢复"；未覆盖的异常分钟继续沿基础链继承并被拒绝。恢复后的修订与普通修订完全
+一致（继承、误差带、接口字段均不变），旧异常修订 #7 仍原样保留可审计。
 
 ### 航段分时航时管制请求 / 响应示例（本轮新增）
 
@@ -1929,6 +2036,31 @@ curl -s -i -X POST $BASE/api/tide/error-revisions \
   -d '{"errors":{"2000":0.5},"base_revision":4}' | head -1   # HTTP/1.1 422（第 2000 分钟无潮位）
 # 旧库升级：启动时自动补 base_revision 列并新建差量表（单事务、幂等），既有
 # 修订号/历史值/已确认快照全部保持可用，升级中断重启不留半迁移状态
+
+# 3d) 本轮修复：潮位与误差必须为有限数——1e309（解析为 Infinity）/ NaN /
+#     -Infinity 一律 422 VALIDATION_ERROR，整次不生成修订（误差负值同口径）：
+curl -s -i -X POST $BASE/api/tide/corrections \
+  -H 'Content-Type: application/json' -d '{"corrections":{"100":1e309}}' | head -1
+# HTTP/1.1 422（body 中 input 被安全序列化为 "Infinity"，不报 500）
+curl -s -i -X POST $BASE/api/tide/error-revisions \
+  -H 'Content-Type: application/json' -d '{"errors":{"100":-0.1}}' | head -1
+# HTTP/1.1 422（误差必须有限非负）
+# 合法的有限大数（如 1e308）仍可提交。
+#
+# 已存历史修订若含旧缺陷遗留的 ±∞/NaN（修订不可变、原样保留）：查询范围命中、
+# 或单船/批次规划、确认、/review 复核与 /reschedule 改期的窗口需要该分钟时，
+# 一律 422 NON_FINITE_TIDE_DATA，details 给出 revision / non_finite_minutes /
+# fields（不按安全放行、不报 500）；不含异常分钟的范围照常返回。
+# 修复方式是以该异常修订为基础分叉，用有限新值逐字段覆盖：
+#   - 名义更正只恢复 level 字段（error 仍继承，异常 error 不恢复）；
+#   - 误差修订只恢复 error 字段（level 仍继承，异常 level 不恢复）；
+#   - 未覆盖的异常分钟继续继承并被 422 拒绝。
+curl -s -X POST $BASE/api/tide/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":7,"corrections":{"100":2.0}}'   # level 恢复
+curl -s -X POST $BASE/api/tide/error-revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":8,"errors":{"101":0.0}}'        # error 恢复 -> 整窗可用
 
 # 4) 用旧修订号再次确认 -> 409 REVISION_STALE
 curl -i -X POST $BASE/api/trips/confirm \

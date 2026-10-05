@@ -1,7 +1,7 @@
 """Pydantic 请求 / 响应模型。"""
 from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import config
 
@@ -139,8 +139,13 @@ class ShipUpdateResponse(ShipOut):
 # ---- 潮位 ----------------------------------------------------------------------
 
 class TideCorrection(BaseModel):
+    # 极大 JSON 数字（如 1e309）会被解析为 Infinity：必须在入口拒绝，否则会
+    # 落入不可变修订导致查询 500、规划把受限分钟误判为可通航。
+    model_config = ConfigDict(allow_inf_nan=False)
+
     corrections: dict[int, float] = Field(
-        description="要覆盖的 {分钟: 名义潮位(米)}；未列出分钟继承基础修订名义潮位与误差"
+        description="要覆盖的 {分钟: 名义潮位(米，必须为有限数，拒绝 ±∞/NaN)}；"
+                    "未列出分钟继承基础修订名义潮位与误差"
     )
     base_revision: Optional[int] = Field(
         default=None, description="所基于的修订号；不填则取最新修订"
@@ -149,9 +154,13 @@ class TideCorrection(BaseModel):
 
 
 class TideErrorRevision(BaseModel):
+    # 同 TideCorrection：±∞/NaN 在入口按 422 VALIDATION_ERROR 拒绝（误差另须
+    # 非负，由端点/服务层校验），整次不生成修订。
+    model_config = ConfigDict(allow_inf_nan=False)
+
     errors: dict[int, float] = Field(
-        description="要覆盖的 {分钟: 预测误差(米，非负)}；未列出分钟继承基础修订误差，"
-                    "名义潮位不变"
+        description="要覆盖的 {分钟: 预测误差(米，必须为有限非负数，拒绝 ±∞/NaN)}；"
+                    "未列出分钟继承基础修订误差，名义潮位不变"
     )
     base_revision: Optional[int] = Field(
         default=None, description="所基于的修订号；不填则取最新修订"

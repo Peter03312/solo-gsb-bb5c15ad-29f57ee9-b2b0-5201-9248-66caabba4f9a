@@ -1,5 +1,6 @@
 """港口潮汐通航行程规划服务 —— FastAPI 入口。"""
 import json
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -79,6 +80,7 @@ from .services.tide import (
     create_correction_revision,
     create_error_revision,
     load_tide_range,
+    require_finite_tide,
 )
 from .services.toll import (
     bill_out,
@@ -140,15 +142,30 @@ def _safe_validation_errors(exc: RequestValidationError) -> list:
     模型级校验（如船号与三项参数互斥）抛出的 ValueError 会出现在 ctx 中，
     不可 JSON 序列化，此处转为字符串；其余可序列化的约束上下文原样保留。
     """
+    def _safe(v):
+        if isinstance(v, Exception):
+            return str(v)
+        if isinstance(v, float) and not math.isfinite(v):
+            # 非有限浮点数（±∞/NaN，如 1e309）无法 JSON 序列化，转为标记串，
+            # 保证"非法提交"本身得到 422 VALIDATION_ERROR 而不是序列化 500
+            if math.isnan(v):
+                return "NaN"
+            return "Infinity" if v > 0 else "-Infinity"
+        if isinstance(v, dict):
+            return {k: _safe(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_safe(x) for x in v]
+        return v
+
     safe = []
     for err in exc.errors():
         err = dict(err)
         ctx = err.get("ctx")
         if ctx:
-            err["ctx"] = {
-                k: (str(v) if isinstance(v, Exception) else v)
-                for k, v in ctx.items()
-            }
+            err["ctx"] = {k: _safe(v) for k, v in ctx.items()}
+        # input 可能直接携带 ±∞/NaN（allow_inf_nan=False 拒绝时即如此）
+        if "input" in err:
+            err["input"] = _safe(err["input"])
         safe.append(err)
     return safe
 
@@ -456,6 +473,10 @@ def get_revision(revision: int, from_minute: int = 0, to_minute: int = 1439):
 
     差量链式存储下沿基础修订链还原该修订在 [from_minute, to_minute] 的完整
     名义潮位与误差（见 services/tide.py）；未知修订 404 TIDE_REVISION_NOT_FOUND。
+
+    历史不可变修订若在该分钟范围内含非有限值（±∞/NaN，旧缺陷遗留），返回
+    422 NON_FINITE_TIDE_DATA（details 给出修订号与异常分钟，不输出 Infinity/
+    NaN，也不报 500）；不含异常分钟的范围仍正常返回。
     """
     with get_conn() as conn:
         if not conn.execute(
@@ -464,6 +485,7 @@ def get_revision(revision: int, from_minute: int = 0, to_minute: int = 1439):
             raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
                            f"潮位修订不存在: {revision}", {"revision": revision})
         tide = load_tide_range(conn, revision, from_minute, to_minute)
+        require_finite_tide(revision, tide)
     ordered = sorted(tide.items())
     return {"revision": revision, "from_minute": from_minute, "to_minute": to_minute,
             "count": len(ordered),
@@ -479,6 +501,9 @@ def apply_correction(body: TideCorrection):
 
     差量落库：本次修订只持久化改动分钟（services/tide.py），写入量随本次
     改动分钟数增长，不再复制基础修订全部分钟。
+
+    每个名义潮位必须为有限数（±∞/NaN 如 1e309 -> 422 VALIDATION_ERROR），
+    非法提交整次不生成修订。
     """
     if not body.corrections:
         raise ApiError(422, "VALIDATION_ERROR", "corrections 不能为空")
@@ -502,6 +527,9 @@ def apply_error_revision(body: TideErrorRevision):
     未列出分钟沿基础修订链继承误差；旧修订（error 列缺失/为 0）一律视为
     误差 0。所提交分钟在基础修订中必须有名义潮位（沿基础链还原判定），
     否则报 MISSING_TIDE_DATA。差量落库：只持久化本次改动分钟。
+
+    每个误差必须为**有限非负数**（负值或 ±∞/NaN 如 1e309 ->
+    422 VALIDATION_ERROR），非法提交整次不生成修订。
     """
     if not body.errors:
         raise ApiError(422, "VALIDATION_ERROR", "errors 不能为空")

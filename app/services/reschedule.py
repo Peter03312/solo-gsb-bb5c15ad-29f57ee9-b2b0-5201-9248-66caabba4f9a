@@ -42,7 +42,7 @@ from .planning import (
     _load_segments,
     load_occupancy,
 )
-from .tide import load_tide_range
+from .tide import load_tide_range, require_finite_tide
 
 
 def review_and_reschedule(
@@ -55,6 +55,7 @@ def review_and_reschedule(
     未知行程 -> TRIP_NOT_FOUND (404)
     目标修订不存在 -> TIDE_REVISION_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
+    窗口内含非有限潮位（±∞/NaN，历史异常修订）-> NON_FINITE_TIDE_DATA (422)
     """
     ctx = _load_review_context(conn, trip_id, revision)
 
@@ -130,7 +131,8 @@ def _load_review_context(conn, trip_id: int, revision: Optional[int]) -> dict:
     """加载复核 / 改期确认共用的快照、修订潮位、航段与泊位上下文。
 
     未知行程 -> TRIP_NOT_FOUND (404)；目标修订不存在 ->
-    TIDE_REVISION_NOT_FOUND (404)；窗口内缺潮位 -> MISSING_TIDE_DATA (422)。
+    TIDE_REVISION_NOT_FOUND (404)；窗口内缺潮位 -> MISSING_TIDE_DATA (422)；
+    窗口内含非有限潮位（±∞/NaN）-> NON_FINITE_TIDE_DATA (422)。
     """
     # 1) 读取不可变快照（只读，不改写）
     row = conn.execute(
@@ -180,6 +182,8 @@ def _load_review_context(conn, trip_id: int, revision: Optional[int]) -> dict:
     missing = [m for m in range(start, horizon) if m not in tide]
     if missing:
         raise tide_missing(missing)
+    # 历史异常修订中的 ±∞/NaN 不按安全处理：全窗口命中即 422（带修订号与分钟）。
+    require_finite_tide(revision, tide)
 
     segs = _load_segments(conn)
 

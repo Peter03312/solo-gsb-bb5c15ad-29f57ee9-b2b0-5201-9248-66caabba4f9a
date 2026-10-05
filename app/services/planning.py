@@ -43,7 +43,7 @@ from .berths import (
     work_fits_calendar,
 )
 from .controls import effective_travel_time, load_controls
-from .tide import load_tide_range
+from .tide import load_tide_range, require_finite_tide
 
 
 @dataclass(frozen=True)
@@ -224,6 +224,7 @@ def find_itinerary(
     未知节点 -> NODE_NOT_FOUND (404)
     未知泊位 -> BERTH_NOT_FOUND (404)；泊位不属终点 -> BERTH_NOT_AT_DESTINATION (422)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
+    窗口内含非有限潮位（±∞/NaN，历史异常修订）-> NON_FINITE_TIDE_DATA (422)
     无可行行程 -> NO_FEASIBLE_ITINERARY (404)
     """
     # 1) 节点校验
@@ -271,6 +272,9 @@ def find_itinerary(
     missing = [m for m in range(start_minute, horizon) if m not in tide]
     if missing:
         raise tide_missing(missing)
+    # 已存不可变修订中由旧缺陷遗留的 ±∞/NaN 绝不参与通航判定（否则无穷潮位
+    # 会把本应受限的分钟误判为可通航）：命中即 422，带修订号与异常分钟。
+    require_finite_tide(revision, tide)
 
     # 4) 起终点相同：零航段，立即抵达（泊位模式下须在起点=终点即时开工）
     if origin == destination:
