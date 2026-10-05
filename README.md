@@ -158,6 +158,21 @@
 并发修订仍在 `BEGIN IMMEDIATE` 事务内串行生效。全部既有 HTTP 接口的
 请求、响应与状态码保持不变。
 
+**本轮修复：潮位数值有限性校验与历史异常的安全拒绝**。此前极大 JSON
+数字（如 `1e309`）会被解析为 Infinity 并随名义潮位更正/误差修订写入
+不可变修订：随后分钟范围查询该修订时响应序列化失败报 500，水深规划
+还会把 Infinity 潮位误判为可通航。修复后——① **写入校验**：两个修订
+写接口的每个提交潮位/误差都必须是**有限数**（拒绝 Infinity/-Infinity/
+NaN），误差仍须非负；任一值非法即 `422 VALIDATION_ERROR`，**整次不
+生成修订**；② **历史异常不改写**：已存含非有限值的修订原样保留，
+分钟范围查询命中异常分钟，或单船/批次规划、确认、潮位复核与改期计算
+的窗口需要该分钟时，一律 `422 INVALID_TIDE_DATA`（`details` 给出修订
+号与异常分钟清单），**绝不按安全处理、绝不报 500**；③ **分叉恢复**：
+以旧修订分叉时，只有异常字段被有限新值覆盖才恢复该分钟（更正只覆盖
+潮位、误差修订只覆盖误差），其余字段及未覆盖分钟仍按原规则继承
+（异常随之带入新修订，读取时同样拒绝）。有效数据的修订继承、误差带
+判定与全部既有接口字段保持兼容；启动与健康检查不受历史异常影响。
+
 ---
 
 ## 1. 启动
@@ -304,6 +319,18 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     **名义潮位不变**；未列出分钟**继承**基础修订的误差，列出分钟覆盖为给定误差；
     误差必须非负（否则 `422 VALIDATION_ERROR`）；所提交分钟在基础修订中必须已有
     名义潮位，否则 `422 MISSING_TIDE_DATA`（误差修订不能凭空新增名义潮位）。
+  - **数值有限性（本轮修复）**：两个写接口的每个提交值都必须是**有限数**
+    （`1e309` 这类 JSON 极大数会解析为 Infinity，与 NaN 一并拒绝），误差
+    仍须非负；任一值非法即 `422 VALIDATION_ERROR`（`details.bad_levels` /
+    `bad_errors` 以字符串给出异常值），**整次不生成修订**。已存修订若含
+    非有限值（本修复前写入的历史数据）**一律不改写**；分钟范围查询命中
+    异常分钟，或单船/批次规划、确认、潮位复核与改期计算的窗口需要该分钟
+    时，一律 `422 INVALID_TIDE_DATA`（`details.revision` +
+    `details.invalid_minutes` 等），**绝不按安全处理**（如把 Infinity 潮位
+    判为可通航）、**绝不报 500**；被拒绝的确认/批次/改期不保存、不登记
+    幂等记录。从异常修订分叉时，只有异常字段被有限新值覆盖才恢复该分钟
+    （更正只覆盖潮位、误差修订只覆盖误差）；其余字段与未覆盖分钟按原规则
+    继承（异常随之带入新修订，读取时同样拒绝）。
   - **差量链式存储（本轮重构）**：每个修订记录 `base_revision` 并只把**本次
     改动的分钟**持久化到差量表（行内为该分钟在新修订下的最终名义潮位与误差），
     未改分钟沿基础修订链继承——写入量随本次改动分钟数增长，不再复制基础修订
@@ -610,8 +637,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 指定潮位修订不存在 / 复核时目标修订未知 / 误差修订的基础修订未知 | 404 | `TIDE_REVISION_NOT_FOUND` |
 | 复核时行程号未知 | 404 | `TRIP_NOT_FOUND` |
 | 窗口内有分钟缺名义潮位 / 误差修订提交分钟在基础修订无名义潮位 | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
+| 查询命中或规划/确认/批次/复核/改期所需分钟在修订中为非有限数值（历史遗留 Infinity/NaN） | 422 | `INVALID_TIDE_DATA`（`details` 给出修订号、异常分钟清单与异常字段；批次附 `ship_index`） |
 | 窗口内无可行行程（含所有潮位可行区间均被已确认占用占满） | 404 | `NO_FEASIBLE_ITINERARY` |
-| 参数校验失败（窗口>1440、航时非正、误差为负、分钟为负等） | 422 | `VALIDATION_ERROR` |
+| 参数校验失败（窗口>1440、航时非正、误差为负、潮位/误差为非有限数、分钟为负等） | 422 | `VALIDATION_ERROR` |
 | 确认时修订已过期（单船与批次一致） | 409 | `REVISION_STALE` |
 | 确认时行程复核不一致（潮位重算结果不同，或占用变化使提交行程不再最优/已无可行解） | 409 | `PLAN_MISMATCH` |
 | 批次预排中任一船失败（未知节点/缺潮位/无可行行程） | 同既有码 | 既有码，`details.ship_index` 给出首个失败序号（0 起） |
@@ -662,6 +690,25 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 3. HTTP API
 
+> **本轮用法（潮位数值有限性校验与历史异常安全拒绝）**：不新增端点、
+> 不改变既有接口的请求/响应结构——
+> - `POST /api/tide/corrections` 与 `POST /api/tide/error-revisions` 的
+>   每个提交值必须为**有限数**（误差仍须非负）；`1e309`（解析为
+>   Infinity）、`NaN` 等非有限值即 `422 VALIDATION_ERROR`
+>   （`details.bad_levels` / `bad_errors` 以字符串给出异常值），
+>   **整次不生成修订**；
+> - 已存含非有限值的修订**不改写**：`GET /api/tide/revisions/{rev}` 命中
+>   异常分钟返回 `422 INVALID_TIDE_DATA`（`details.revision`、
+>   `details.invalid_minutes`、`details.bad_values`），不再报 500；
+> - 单船/批次规划与确认、潮位复核（`/review`）与改期确认
+>   （`/reschedule`）的窗口需要异常分钟时同样 `422 INVALID_TIDE_DATA`
+>   （批次附 `details.ship_index`），**绝不把 Infinity 潮位按可通航
+>   处理**；被拒绝的确认/批次/改期不保存、不登记幂等记录（同一幂等键
+>   可再次用于首次成功提交）；
+> - 以异常修订为 `base_revision` 分叉时，异常字段被有限新值覆盖的分钟
+>   即恢复；其余字段与未覆盖分钟按原规则继承（异常随之带入新修订，
+>   读取时同样拒绝）。
+>
 > **本轮用法（潮位修订差量链式存储）**：不新增端点、不改变任何既有接口的
 > 请求/响应与状态码——`POST /api/tide/corrections`、`POST
 > /api/tide/error-revisions` 与 `GET /api/tide/revisions/{rev}` 的语义
@@ -908,8 +955,9 @@ POST /api/tide/error-revisions
 }
 ```
 
-- `errors`：`{非负整数分钟: 非负误差(米)}`，不能为空；分钟或误差为负返回
-  `422 VALIDATION_ERROR`；
+- `errors`：`{非负整数分钟: 非负误差(米)}`，不能为空；分钟为负、误差为负
+  或任一值为非有限数（`1e309` 解析出的 Infinity、NaN）均返回
+  `422 VALIDATION_ERROR`，整次不产生新修订；
 - `base_revision` 可省略，省略时基于**最新**修订；基础修订不存在返回
   `404 TIDE_REVISION_NOT_FOUND`；
 - 提交的任一分钟在基础修订中没有名义潮位，返回 `422 MISSING_TIDE_DATA`，不产生
@@ -970,6 +1018,67 @@ curl -s "$BASE/api/tide/revisions/3?from_minute=100&to_minute=101"
   的分钟（沿基础链还原判定），否则 `422 MISSING_TIDE_DATA` 且不产生新修订；
 - 旧库升级后，既有修订作为物化修订原样可查，新修订一律差量落库；规划、确认、
   批次与改期复核按同一修订号读到的数据与升级前完全一致。
+
+### 潮位数值校验与历史异常处理示例（本轮修复）
+
+极大 JSON 数字（如 `1e309`）会被解析为 Infinity；两个修订写接口现在一律
+拒绝非有限提交值（误差仍须非负），**整次不生成修订**：
+
+```bash
+curl -s -X POST $BASE/api/tide/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections": {"100": 1e309}}'
+```
+
+```json
+{ "error": { "code": "VALIDATION_ERROR",
+  "message": "名义潮位必须为有限数（米），不接受 Infinity/NaN",
+  "details": { "bad_levels": [ { "minute": 100, "level": "Infinity" } ] } } }
+```
+
+```bash
+curl -s -X POST $BASE/api/tide/error-revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"errors": {"100": NaN}}'
+# 422 VALIDATION_ERROR —— details.bad_errors: [{"minute": 100, "error": "NaN"}]
+```
+
+已存修订若含非有限值（本修复前写入的历史数据），历史**不改写**；分钟范围
+查询命中异常分钟返回 `422 INVALID_TIDE_DATA`（附修订号与分钟），不再报 500：
+
+```bash
+curl -s "$BASE/api/tide/revisions/2?from_minute=0&to_minute=1439"
+```
+
+```json
+{ "error": { "code": "INVALID_TIDE_DATA",
+  "message": "潮位修订 #2 中有 1 个分钟存在非有限数值（Infinity/NaN），无法安全使用该修订；请以有限值提交名义潮位更正或误差修订覆盖异常字段后使用新修订",
+  "details": { "revision": 2, "invalid_minutes": [100], "total_invalid": 1,
+    "bad_values": [ { "minute": 100, "fields": { "level": "Infinity" } } ] } } }
+```
+
+单船/批次规划与确认、潮位复核（`POST /api/trips/{id}/review`）与改期确认
+（`POST /api/trips/{id}/reschedule`）的窗口需要异常分钟时，同样以
+`422 INVALID_TIDE_DATA` 拒绝（批次附 `details.ship_index`），**绝不把
+Infinity 潮位按可通航处理**；被拒绝的确认/批次/改期不保存、不登记幂等
+记录（同一幂等键可再次用于首次成功提交）。窗口不覆盖异常分钟的请求不受
+影响。
+
+**恢复方式**：以异常修订为 `base_revision` 分叉，用有限新值覆盖异常字段
+——更正只覆盖潮位、误差修订只覆盖误差；其余字段与未覆盖分钟按原规则继承
+（异常随之带入新修订，读取时同样拒绝）：
+
+```bash
+# 设修订 #2 第 100 分钟潮位为历史遗留 Infinity：以 #2 为基础更正该分钟为有限值
+curl -s -X POST $BASE/api/tide/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections": {"100": 2.0}, "base_revision": 2}'
+# 201 {"revision": 3, ...}
+
+curl -s "$BASE/api/tide/revisions/3?from_minute=100&to_minute=100"
+# {"revision":3,"from_minute":100,"to_minute":100,"count":1,
+#  "levels":{"100":2.0},"errors":{"100":0.0}}   —— 第 100 分钟已恢复
+```
 
 ### 航段分时航时管制请求 / 响应示例（本轮新增）
 
@@ -2717,6 +2826,15 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
    不搬运任何历史行——升级是纯元数据变更；中断则事务整体回滚，重启后重跑
    即可愈合，不会留下半迁移状态。修订号、历史值与已确认行程快照全部保持
    可用，升级前后的分钟范围查询结果完全一致。
+5. **数值有限性（本轮修复）**：写入侧 `validate_submitted_levels` /
+   `validate_submitted_errors` 在任何落库动作之前拒绝非有限提交值
+   （Infinity/NaN；误差另须非负）——`422 VALIDATION_ERROR`、整次不生成
+   修订；读取侧 `ensure_finite_tide` 在分钟范围查询、规划（`_load_tide`
+   之后）与复核/改期上下文（`_load_review_context`）中扫描还原结果，
+   命中历史遗留的非有限分钟即 `422 INVALID_TIDE_DATA`（`errors.tide_invalid`
+   构造，details 只携带字符串化的异常值，避免响应序列化再次失败）。继承
+   路径（`resolve_tide_minutes`）不做拦截：异常字段被有限新值覆盖的分钟
+   即恢复，未覆盖的异常按原规则带入新修订、读取时同样拒绝。
 
 ---
 
@@ -2726,10 +2844,10 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 app/
   config.py             # 环境变量配置
   database.py           # SQLite 连接、建表、演示数据初始化
-  errors.py             # 统一业务错误（含 trip_not_found 构造器）
+  errors.py             # 统一业务错误（含 trip_not_found / tide_invalid 构造器）
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
   services/controls.py  # 航段分时航时管制：区间校验、整组替换、按进入分钟取实际航时
-  services/tide.py      # 潮位修订差量链式存储：base_revision 链、差量落库（写入量随改动分钟数）、沿链还原任意历史修订
+  services/tide.py      # 潮位修订差量链式存储：base_revision 链、差量落库（写入量随改动分钟数）、沿链还原任意历史修订；提交值有限性校验与历史非有限值拒绝
   services/groups.py    # 狭窄水道组：登记（单事务、不留半成品）、组关系读取与整组占用展开
   services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定；load_occupancy 展开组占用）
   services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键；批内拟占用同步展开组占用）
@@ -2739,7 +2857,7 @@ app/
   services/toll.py      # 通行费：费率版本（整组替换+继承，不可变）、开单（按当时最新版本与快照进入分钟固化）、冲销/查询
   services/ships.py     # 船舶档案：建档/版本化变更（单事务）、当前与历史版本查询、规划/确认用档案解析
   main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/船舶档案/潮位更正与误差修订/单船与批次规划确认/复核改期/改期确认/作废）
-tests/                  # pytest 测试（249 个，含择优、缺潮位、事务冲突、误差带、复核改期、改期确认与幂等/冲销、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认、潮位差量链式存储与旧库升级等）
+tests/                  # pytest 测试（268 个，含择优、缺潮位、事务冲突、误差带、复核改期、改期确认与幂等/冲销、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认、潮位差量链式存储与旧库升级、潮位数值有限性校验与历史异常拒绝等）
 Dockerfile
 docker-compose.yml
 requirements.txt

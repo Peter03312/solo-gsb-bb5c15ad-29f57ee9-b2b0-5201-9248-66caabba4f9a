@@ -42,7 +42,7 @@ from .planning import (
     _load_segments,
     load_occupancy,
 )
-from .tide import load_tide_range
+from .tide import ensure_finite_tide, load_tide_range
 
 
 def review_and_reschedule(
@@ -55,6 +55,7 @@ def review_and_reschedule(
     未知行程 -> TRIP_NOT_FOUND (404)
     目标修订不存在 -> TIDE_REVISION_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
+    窗口内潮位含非有限数值（历史遗留异常） -> INVALID_TIDE_DATA (422)
     """
     ctx = _load_review_context(conn, trip_id, revision)
 
@@ -130,7 +131,8 @@ def _load_review_context(conn, trip_id: int, revision: Optional[int]) -> dict:
     """加载复核 / 改期确认共用的快照、修订潮位、航段与泊位上下文。
 
     未知行程 -> TRIP_NOT_FOUND (404)；目标修订不存在 ->
-    TIDE_REVISION_NOT_FOUND (404)；窗口内缺潮位 -> MISSING_TIDE_DATA (422)。
+    TIDE_REVISION_NOT_FOUND (404)；窗口内缺潮位 -> MISSING_TIDE_DATA (422)；
+    窗口内潮位含非有限数值 -> INVALID_TIDE_DATA (422)。
     """
     # 1) 读取不可变快照（只读，不改写）
     row = conn.execute(
@@ -175,11 +177,14 @@ def _load_review_context(conn, trip_id: int, revision: Optional[int]) -> dict:
                        f"潮位修订不存在: {revision}", {"revision": revision})
 
     # 3) 全窗口潮位：任一分钟缺失即报错（与规划一致；差量链式存储下沿基础
-    #    修订链还原，同一修订号永远读到同一份数据）
+    #    修订链还原，同一修订号永远读到同一份数据）；含非有限数值（历史遗留
+    #    异常）的分钟被需要时同样拒绝（422 INVALID_TIDE_DATA，附修订号与
+    #    分钟），绝不按安全处理
     tide = load_tide_range(conn, revision, start, horizon - 1)
     missing = [m for m in range(start, horizon) if m not in tide]
     if missing:
         raise tide_missing(missing)
+    ensure_finite_tide(revision, tide)
 
     segs = _load_segments(conn)
 

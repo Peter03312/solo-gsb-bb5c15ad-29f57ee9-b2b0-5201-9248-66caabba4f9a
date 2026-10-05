@@ -78,7 +78,10 @@ from .services.ships import (
 from .services.tide import (
     create_correction_revision,
     create_error_revision,
+    ensure_finite_tide,
     load_tide_range,
+    validate_submitted_errors,
+    validate_submitted_levels,
 )
 from .services.toll import (
     bill_out,
@@ -464,6 +467,9 @@ def get_revision(revision: int, from_minute: int = 0, to_minute: int = 1439):
             raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
                            f"潮位修订不存在: {revision}", {"revision": revision})
         tide = load_tide_range(conn, revision, from_minute, to_minute)
+        # 历史遗留的非有限数值（如 1e309 写入的 Infinity）：命中查询范围即
+        # 422 INVALID_TIDE_DATA（附修订号与分钟），不序列化异常值、不报 500
+        ensure_finite_tide(revision, tide)
     ordered = sorted(tide.items())
     return {"revision": revision, "from_minute": from_minute, "to_minute": to_minute,
             "count": len(ordered),
@@ -478,7 +484,9 @@ def apply_correction(body: TideCorrection):
     分钟误差为 0），未列出分钟连同误差沿基础修订链继承。
 
     差量落库：本次修订只持久化改动分钟（services/tide.py），写入量随本次
-    改动分钟数增长，不再复制基础修订全部分钟。
+    改动分钟数增长，不再复制基础修订全部分钟。提交的每个潮位必须为有限数
+    （拒绝 1e309 解析出的 Infinity 与 NaN），否则 422 VALIDATION_ERROR
+    且整次不生成修订。
     """
     if not body.corrections:
         raise ApiError(422, "VALIDATION_ERROR", "corrections 不能为空")
@@ -486,6 +494,7 @@ def apply_correction(body: TideCorrection):
     if bad:
         raise ApiError(422, "VALIDATION_ERROR", "分钟必须为非负整数",
                        {"bad_minutes": bad})
+    validate_submitted_levels(body.corrections)
 
     with get_conn() as conn:
         row = create_correction_revision(
@@ -501,7 +510,9 @@ def apply_error_revision(body: TideErrorRevision):
 
     未列出分钟沿基础修订链继承误差；旧修订（error 列缺失/为 0）一律视为
     误差 0。所提交分钟在基础修订中必须有名义潮位（沿基础链还原判定），
-    否则报 MISSING_TIDE_DATA。差量落库：只持久化本次改动分钟。
+    否则报 MISSING_TIDE_DATA。差量落库：只持久化本次改动分钟。提交的每个
+    误差必须为有限的非负数（拒绝 Infinity/NaN 与负值），否则
+    422 VALIDATION_ERROR 且整次不生成修订。
     """
     if not body.errors:
         raise ApiError(422, "VALIDATION_ERROR", "errors 不能为空")
@@ -509,12 +520,7 @@ def apply_error_revision(body: TideErrorRevision):
     if bad_minutes:
         raise ApiError(422, "VALIDATION_ERROR", "分钟必须为非负整数",
                        {"bad_minutes": bad_minutes})
-    bad_errors = [
-        {"minute": m, "error": e} for m, e in sorted(body.errors.items()) if e < 0
-    ]
-    if bad_errors:
-        raise ApiError(422, "VALIDATION_ERROR", "潮位误差必须为非负数（米）",
-                       {"bad_errors": bad_errors})
+    validate_submitted_errors(body.errors)
 
     with get_conn() as conn:
         row = create_error_revision(

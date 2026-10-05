@@ -34,6 +34,31 @@ def trip_not_found(trip_id: int) -> ApiError:
                     {"trip_id": trip_id})
 
 
+def tide_invalid(revision: int, invalid) -> ApiError:
+    """已存修订的还原数据含非有限数值（历史遗留异常，如 1e309 解析出的
+    Infinity）：命中这些分钟的查询/规划/复核一律拒绝，绝不按安全处理。
+
+    ``invalid`` 为 ``[(minute, {字段: 非有限值的字符串表示}), ...]``（按分钟
+    升序）；details 只携带可 JSON 化的字符串表示，避免响应序列化再次失败。
+    """
+    shown = list(invalid)[:20]
+    return ApiError(
+        422,
+        "INVALID_TIDE_DATA",
+        f"潮位修订 #{revision} 中有 {len(invalid)} 个分钟存在非有限数值"
+        "（Infinity/NaN），无法安全使用该修订；请以有限值提交名义潮位更正或"
+        "误差修订覆盖异常字段后使用新修订",
+        {
+            "revision": revision,
+            "invalid_minutes": [m for m, _ in shown],
+            "total_invalid": len(invalid),
+            "bad_values": [
+                {"minute": m, "fields": fields} for m, fields in shown
+            ],
+        },
+    )
+
+
 def no_itinerary(origin: str, destination: str) -> ApiError:
     return ApiError(
         404,
